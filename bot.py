@@ -94,6 +94,20 @@ def review_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
+INTRO_TEXT = (
+    "👋 <b>Как это работает</b>\n"
+    "1️⃣ Выбираете точку\n"
+    "2️⃣ Выбираете категорию (или «Все категории»)\n"
+    "3️⃣ Бот присылает список позиций — отвечаете <b>одним сообщением</b>: "
+    "числа по порядку, каждое на новой строке, столько же чисел, сколько позиций\n"
+    "4️⃣ Бот сам считает, что нужно заказать, и показывает сводку\n"
+    "5️⃣ Проверяете и жмёте «Отправить»\n\n"
+    "❗️Вписываете не «сколько заказать», а <b>сколько сейчас есть по факту</b> — "
+    "заказ бот посчитает сам.\n\n"
+    "Команда /help — показать это ещё раз в любой момент."
+)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -104,11 +118,17 @@ async def cmd_start(message: Message, state: FSMContext):
             "либо (если вы админ) создайте точку через /admin."
         )
         return
+    await message.answer(INTRO_TEXT, parse_mode="HTML")
     await message.answer(
-        "Привет! Выберите точку, по которой заполняем остатки:",
+        "Выберите точку, по которой заполняем остатки:",
         reply_markup=points_keyboard(),
     )
     await state.set_state(OrderForm.choosing_point)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(INTRO_TEXT, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "back:points")
@@ -169,6 +189,20 @@ def format_category_form(products) -> str:
     ]
     for i, p in enumerate(products, 1):
         lines.append(f"{i}. {p['name']} — мин {p['min_qty']:g} / макс {p['max_qty']:g} {p['unit']}")
+
+    example_n = min(2, len(products))
+    example_products = products[:example_n]
+    example_values = [max(round((p["min_qty"] + p["max_qty"]) / 2), 1) for p in example_products]
+
+    lines.append("")
+    lines.append("💡 <b>Пример:</b> если сейчас")
+    for p, v in zip(example_products, example_values):
+        lines.append(f"• {p['name']} — {v:g} {p['unit']}")
+    if len(products) > example_n:
+        lines.append(f"• …а по остальным {len(products) - example_n} позициям — свои числа")
+    lines.append("то ваш ответ начинается так:")
+    lines.append("<code>" + "\n".join(f"{v:g}" for v in example_values) + ("\n…" if len(products) > example_n else "") + "</code>")
+
     return "\n".join(lines)
 
 
@@ -214,12 +248,15 @@ async def receive_bulk_facts(message: Message, state: FSMContext):
 
     numbers, expected_count = parse_bulk_numbers(message.text or "", expected)
     if numbers is None:
+        got = len((message.text or "").split()) if "\n" not in (message.text or "").strip() else len([l for l in (message.text or "").splitlines() if l.strip()])
         await message.answer(
-            f"Не получилось разобрать числа. Нужно ровно <b>{expected_count}</b> значений "
-            f"(по одному на позицию из списка выше), каждое ≥ 0. Отправьте ещё раз, "
-            f"каждое число на новой строке.",
+            f"⚠️ Не получилось разобрать числа: похоже, их {got}, а нужно ровно "
+            f"<b>{expected_count}</b> — по одному на каждую позицию ниже, каждое ≥ 0.\n"
+            f"Отправьте ещё раз одним сообщением, число на новой строке:",
             parse_mode="HTML",
         )
+        products = [db.get_product(pid) for pid in product_ids]
+        await message.answer(format_category_form(products), parse_mode="HTML")
         return
 
     answers = {str(pid): val for pid, val in zip(product_ids, numbers)}
