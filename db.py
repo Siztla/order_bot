@@ -13,7 +13,9 @@ CREATE TABLE IF NOT EXISTS points (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
     chat_id INTEGER,               -- куда слать готовый заказ; NULL = слать в чат, откуда пришёл запрос
-    header_template TEXT NOT NULL DEFAULT '📦 Заказ — {point}, {date}'
+    header_template TEXT NOT NULL DEFAULT '📦 Заказ — {point}, {date}',
+    reminder_time TEXT,            -- 'ЧЧ:ММ' по времени сервера, NULL = напоминание выключено
+    reminder_chat_id INTEGER       -- NULL = слать туда же, куда уходит заказ (chat_id)
 );
 
 CREATE TABLE IF NOT EXISTS categories (
@@ -43,7 +45,26 @@ CREATE TABLE IF NOT EXISTS entries (
     telegram_user_id INTEGER,
     entered_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reminder_log (
+    point_id INTEGER NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    sent_date TEXT NOT NULL,       -- 'YYYY-MM-DD'
+    PRIMARY KEY (point_id, sent_date)
+);
 """
+
+MIGRATIONS = [
+    ("points", "reminder_time", "TEXT"),
+    ("points", "reminder_chat_id", "INTEGER"),
+]
+
+
+def _migrate(conn):
+    """Добавляет недостающие колонки в уже существующую базу (созданную старой версией схемы)."""
+    for table, column, coltype in MIGRATIONS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 @contextmanager
@@ -61,6 +82,7 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 # ---------- Points ----------
@@ -227,4 +249,71 @@ def save_entry(product_id: int, fact_qty: float, employee: str, telegram_user_id
             """INSERT INTO entries (product_id, fact_qty, employee, telegram_user_id, entered_at)
                VALUES (?, ?, ?, ?, ?)""",
             (product_id, fact_qty, employee, telegram_user_id, datetime.now().isoformat(timespec="seconds")),
+        )
+
+
+def last_facts_for(product_ids):
+    """Возвращает {product_id: последний_введённый_факт} по самой свежей записи в entries.
+    Для позиций без истории ключ отсутствует."""
+    if not product_ids:
+        return {}
+    placeholders = ",".join("?" for _ in product_ids)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT e.product_id, e.fact_qty
+                FROM entries e
+                JOIN (
+                    SELECT product_id, MAX(entered_at) AS latest
+                    FROM entries WHERE product_id IN ({placeholders})
+                    GROUP BY product_id
+                ) last ON last.product_id = e.product_id AND last.latest = e.entered_at""",
+            list(product_ids),
+        ).fetchall()
+        return {row["product_id"]: row["fact_qty"] for row in rows}
+
+
+# ---------- Напоминания ----------
+
+def set_reminder(point_id: int, reminder_time, reminder_chat_id=None):
+    """reminder_time: строка 'ЧЧ:ММ' или None, чтобы выключить напоминание для точки."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE points SET reminder_time = ?, reminder_chat_id = ? WHERE id = ?",
+            (reminder_time, reminder_chat_id, point_id),
+        )
+
+
+def points_with_reminders():
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM points WHERE reminder_time IS NOT NULL"
+        ).fetchall()
+
+
+def has_entries_today(point_id: int, today: str) -> bool:
+    """today: 'YYYY-MM-DD'. Проверяет, заполнял ли кто-то остатки по этой точке сегодня."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) c FROM entries e
+               JOIN products p ON p.id = e.product_id
+               WHERE p.point_id = ? AND substr(e.entered_at, 1, 10) = ?""",
+            (point_id, today),
+        ).fetchone()
+        return row["c"] > 0
+
+
+def was_reminder_sent(point_id: int, date_str: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM reminder_log WHERE point_id = ? AND sent_date = ?",
+            (point_id, date_str),
+        ).fetchone()
+        return row is not None
+
+
+def mark_reminder_sent(point_id: int, date_str: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO reminder_log (point_id, sent_date) VALUES (?, ?)",
+            (point_id, date_str),
         )

@@ -30,10 +30,15 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 import db
@@ -47,6 +52,21 @@ def is_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
 
+START_TRIGGERS = {
+    "старт", "start", "заказ", "заказы", "остатки", "меню", "menu",
+    "привет", "здравствуйте", "начать", "заполнить", "заполнить остатки",
+    "📦 заполнить остатки",
+}
+ADMIN_TRIGGERS = {"админ", "admin", "панель", "админка", "админ-панель", "⚙️ админ-панель"}
+
+
+def main_reply_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(text="📦 Заполнить остатки")]]
+    if is_admin(user_id):
+        rows.append([KeyboardButton(text="⚙️ Админ-панель")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
 # ============================================================================
 #  ЗАКАЗЫ
 # ============================================================================
@@ -57,6 +77,7 @@ class OrderForm(StatesGroup):
     choosing_category = State()
     filling = State()
     reviewing = State()
+    editing_single = State()
 
 
 def status_icon(fact: float, min_qty: float, max_qty: float) -> str:
@@ -65,6 +86,13 @@ def status_icon(fact: float, min_qty: float, max_qty: float) -> str:
     if fact > max_qty:
         return "🔵"
     return "🟢"
+
+
+def nav_row():
+    return [
+        InlineKeyboardButton(text="⬅️ Категории", callback_data="nav:back_categories"),
+        InlineKeyboardButton(text="🏠 Точки", callback_data="back:points"),
+    ]
 
 
 def points_keyboard(prefix="point"):
@@ -81,17 +109,51 @@ def categories_keyboard(categories):
     kb = [[InlineKeyboardButton(text="📦 Все категории", callback_data="cat:ALL")]]
     for c in categories:
         kb.append([InlineKeyboardButton(text=c["name"], callback_data=f"cat:{c['id']}")])
-    kb.append([InlineKeyboardButton(text="⬅️ Сменить точку", callback_data="back:points")])
+    kb.append([InlineKeyboardButton(text="🏠 Сменить точку", callback_data="back:points")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def category_form_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[nav_row()])
 
 
 def review_keyboard():
     kb = [
         [InlineKeyboardButton(text="✅ Отправить", callback_data="review:send")],
+        [InlineKeyboardButton(text="🔧 Исправить одну позицию", callback_data="review:fix_one")],
         [InlineKeyboardButton(text="✏️ Заполнить заново", callback_data="review:redo")],
+        nav_row(),
         [InlineKeyboardButton(text="❌ Отмена", callback_data="review:cancel")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def fix_one_keyboard(product_ids, answers):
+    kb = []
+    for pid in product_ids:
+        p = db.get_product(pid)
+        fact = answers[str(pid)]
+        kb.append([InlineKeyboardButton(text=f"✏️ {p['name']} (сейчас {fact:g})", callback_data=f"fixitem:{pid}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад к сводке", callback_data="review:cancel_fix")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.callback_query(F.data == "nav:back_categories")
+async def nav_back_categories(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    point_id = data.get("point_id")
+    if not point_id:
+        await cb.answer("Начните заново — /start", show_alert=True)
+        return
+    point = db.get_point(point_id)
+    categories = categories_with_products(point_id)
+    await cb.message.answer(
+        f"Точка: <b>{point['name']}</b>\nЧто заполняем — все позиции или одну категорию?",
+        reply_markup=categories_keyboard(categories),
+        parse_mode="HTML",
+    )
+    await state.set_state(OrderForm.choosing_category)
+    await cb.answer()
 
 
 INTRO_TEXT = (
@@ -104,21 +166,25 @@ INTRO_TEXT = (
     "5️⃣ Проверяете и жмёте «Отправить»\n\n"
     "❗️Вписываете не «сколько заказать», а <b>сколько сейчас есть по факту</b> — "
     "заказ бот посчитает сам.\n\n"
-    "Команда /help — показать это ещё раз в любой момент."
+    "🧭 Ошиблись с точкой или категорией? На каждом шаге есть кнопки "
+    "«⬅️ Категории» и «🏠 Точки» — вернут назад, ничего не отменяя.\n"
+    "📋 Кнопка «Меню» рядом с полем ввода — быстрый доступ к /start и /help в любой момент.\n"
+    "🔘 Кнопка «📦 Заполнить остатки» внизу экрана всегда под рукой — не нужно помнить команды.\n"
+    "💬 Можно просто написать «остатки», «заказ» или «привет» — бот поймёт это так же, как /start."
 )
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def do_start(message: Message, state: FSMContext):
     await state.clear()
     points = db.list_points()
     if not points:
         await message.answer(
             "Каталог точек пуст. Заполните seed_products.xlsx и запустите import_products.py, "
-            "либо (если вы админ) создайте точку через /admin."
+            "либо (если вы админ) создайте точку через /admin.",
+            reply_markup=main_reply_keyboard(message.from_user.id),
         )
         return
-    await message.answer(INTRO_TEXT, parse_mode="HTML")
+    await message.answer(INTRO_TEXT, parse_mode="HTML", reply_markup=main_reply_keyboard(message.from_user.id))
     await message.answer(
         "Выберите точку, по которой заполняем остатки:",
         reply_markup=points_keyboard(),
@@ -126,9 +192,41 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(OrderForm.choosing_point)
 
 
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await do_start(message, state)
+
+
+@router.message(F.text.func(lambda t: t and t.strip().lower() in START_TRIGGERS))
+async def start_trigger(message: Message, state: FSMContext):
+    await do_start(message, state)
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(INTRO_TEXT, parse_mode="HTML")
+
+
+async def do_admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Эта команда доступна только администраторам.")
+        return
+    await state.clear()
+    await message.answer("🛠 Админ-панель", reply_markup=main_reply_keyboard(message.from_user.id))
+    kb = points_keyboard(prefix="adminpoint")
+    kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Новая точка", callback_data="adminpoint:NEW")])
+    await message.answer("Выберите точку для редактирования каталога:", reply_markup=kb)
+    await state.set_state(AdminForm.picking_point)
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    await do_admin(message, state)
+
+
+@router.message(F.text.func(lambda t: t and t.strip().lower() in ADMIN_TRIGGERS))
+async def admin_trigger(message: Message, state: FSMContext):
+    await do_admin(message, state)
 
 
 @router.callback_query(F.data == "back:points")
@@ -181,14 +279,26 @@ async def category_chosen(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-def format_category_form(products) -> str:
+def format_category_form(products, last_facts=None) -> str:
+    last_facts = last_facts or {}
     lines = [
         "📝 Впишите факт по каждой позиции <b>одним сообщением</b>:",
         "каждое число — на новой строке, по порядку, без нумерации.",
         "",
     ]
+    has_history = False
     for i, p in enumerate(products, 1):
-        lines.append(f"{i}. {p['name']} — мин {p['min_qty']:g} / макс {p['max_qty']:g} {p['unit']}")
+        last = last_facts.get(p["id"])
+        suffix = ""
+        if last is not None:
+            has_history = True
+            suffix = f" <i>(в прошлый раз: {last:g})</i>"
+        lines.append(f"{i}. {p['name']} — мин {p['min_qty']:g} / макс {p['max_qty']:g} {p['unit']}{suffix}")
+
+    if has_history:
+        lines.append("")
+        lines.append("🔁 Если по позиции ничего не изменилось — вместо числа поставьте <code>=</code>, "
+                      "бот возьмёт значение из прошлого раза.")
 
     example_n = min(2, len(products))
     example_products = products[:example_n]
@@ -208,20 +318,32 @@ def format_category_form(products) -> str:
 
 async def send_category_form(message: Message, state: FSMContext):
     data = await state.get_data()
-    products = [db.get_product(pid) for pid in data["product_ids"]]
-    await message.answer(format_category_form(products), parse_mode="HTML")
+    product_ids = data["product_ids"]
+    products = [db.get_product(pid) for pid in product_ids]
+    last_facts = db.last_facts_for(product_ids)
+    await message.answer(
+        format_category_form(products, last_facts), parse_mode="HTML", reply_markup=category_form_keyboard()
+    )
 
 
-def parse_bulk_numbers(text: str, expected: int):
+def parse_bulk_numbers(text: str, expected: int, last_values=None):
     """Пытается разобрать текст в список из `expected` чисел ≥ 0.
+    Токен '=' означает «взять значение из прошлого раза» (last_values[i]), если оно известно.
     Сначала пробует по строкам, затем — по пробелам. Возвращает (numbers, error)."""
+    last_values = last_values or [None] * expected
     for splitter in (lambda t: [l.strip() for l in t.splitlines() if l.strip()],
                       lambda t: t.split()):
         tokens = splitter(text)
         if len(tokens) != expected:
             continue
         numbers = []
-        for tok in tokens:
+        for i, tok in enumerate(tokens):
+            if tok == "=":
+                if last_values[i] is None:
+                    numbers = None
+                    break
+                numbers.append(last_values[i])
+                continue
             tok_clean = tok.replace(",", ".")
             m = re.match(r"^\d+[.)]\s*(.+)$", tok_clean)  # снять нумерацию "1." если её вписали
             if m:
@@ -245,18 +367,23 @@ async def receive_bulk_facts(message: Message, state: FSMContext):
     data = await state.get_data()
     product_ids = data["product_ids"]
     expected = len(product_ids)
+    last_facts = db.last_facts_for(product_ids)
+    last_values = [last_facts.get(pid) for pid in product_ids]
 
-    numbers, expected_count = parse_bulk_numbers(message.text or "", expected)
+    numbers, expected_count = parse_bulk_numbers(message.text or "", expected, last_values)
     if numbers is None:
         got = len((message.text or "").split()) if "\n" not in (message.text or "").strip() else len([l for l in (message.text or "").splitlines() if l.strip()])
         await message.answer(
             f"⚠️ Не получилось разобрать числа: похоже, их {got}, а нужно ровно "
-            f"<b>{expected_count}</b> — по одному на каждую позицию ниже, каждое ≥ 0.\n"
+            f"<b>{expected_count}</b> — по одному на каждую позицию ниже, каждое ≥ 0 (или <code>=</code>, "
+            f"если для позиции есть значение из прошлого раза).\n"
             f"Отправьте ещё раз одним сообщением, число на новой строке:",
             parse_mode="HTML",
         )
         products = [db.get_product(pid) for pid in product_ids]
-        await message.answer(format_category_form(products), parse_mode="HTML")
+        await message.answer(
+            format_category_form(products, last_facts), parse_mode="HTML", reply_markup=category_form_keyboard()
+        )
         return
 
     answers = {str(pid): val for pid, val in zip(product_ids, numbers)}
@@ -302,6 +429,55 @@ async def review_redo(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(f"Заполняем заново: <b>{data['category_label']}</b>", parse_mode="HTML")
     await send_category_form(cb.message, state)
     await cb.answer()
+
+
+@router.callback_query(OrderForm.reviewing, F.data == "review:fix_one")
+async def review_fix_one_start(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await cb.message.edit_text(
+        "Какую позицию исправить?",
+        reply_markup=fix_one_keyboard(data["product_ids"], data["answers"]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(OrderForm.reviewing, F.data == "review:cancel_fix")
+async def review_cancel_fix(cb: CallbackQuery, state: FSMContext):
+    await show_review(cb.message, state)
+    await cb.answer()
+
+
+@router.callback_query(OrderForm.reviewing, F.data.startswith("fixitem:"))
+async def fixitem_chosen(cb: CallbackQuery, state: FSMContext):
+    product_id = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    product = db.get_product(product_id)
+    old_fact = data["answers"][str(product_id)]
+    await state.update_data(fix_product_id=product_id)
+    await state.set_state(OrderForm.editing_single)
+    await cb.message.edit_text(
+        f"«{product['name']}»\nСейчас указано: {old_fact:g} {product['unit']}\n"
+        f"Введите новое значение (мин {product['min_qty']:g} / макс {product['max_qty']:g}):",
+    )
+    await cb.answer()
+
+
+@router.message(OrderForm.editing_single)
+async def receive_fix_value(message: Message, state: FSMContext):
+    text = (message.text or "").strip().replace(",", ".")
+    try:
+        val = float(text)
+        if val < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Нужно одно число ≥ 0, например: 6 или 4.5. Введите ещё раз:")
+        return
+
+    data = await state.get_data()
+    answers = data["answers"]
+    answers[str(data["fix_product_id"])] = val
+    await state.update_data(answers=answers)
+    await show_review(message, state)
 
 
 @router.callback_query(OrderForm.reviewing, F.data == "review:cancel")
@@ -370,6 +546,7 @@ class AdminForm(StatesGroup):
     edit_name = State()
     rename_category = State()
     confirm_delete = State()
+    set_reminder_time = State()
 
 
 def admin_menu_keyboard():
@@ -381,6 +558,7 @@ def admin_menu_keyboard():
         [InlineKeyboardButton(text="✏️ Переименовать категорию", callback_data="admin:rename_category")],
         [InlineKeyboardButton(text="🗑 Удалить позицию", callback_data="admin:delete_product")],
         [InlineKeyboardButton(text="🗑 Удалить категорию", callback_data="admin:delete_category")],
+        [InlineKeyboardButton(text="⏰ Напоминание", callback_data="admin:reminder")],
         [InlineKeyboardButton(text="📋 Показать каталог", callback_data="admin:show_catalog")],
         [InlineKeyboardButton(text="⬅️ Сменить точку", callback_data="admin:back_points")],
     ]
@@ -409,19 +587,6 @@ def confirm_keyboard():
         [InlineKeyboardButton(text="❌ Отмена", callback_data="admconfirm:no")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-@router.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("Эта команда доступна только администраторам.")
-        return
-    await state.clear()
-    points = db.list_points()
-    kb = points_keyboard(prefix="adminpoint")
-    kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Новая точка", callback_data="adminpoint:NEW")])
-    await message.answer("🛠 Админ-панель. Выберите точку для редактирования каталога:", reply_markup=kb)
-    await state.set_state(AdminForm.picking_point)
 
 
 @router.callback_query(AdminForm.picking_point, F.data.startswith("adminpoint:"))
@@ -495,6 +660,45 @@ async def admin_show_catalog(cb: CallbackQuery, state: FSMContext):
             lines.append(f"  • {p['name']} — мин {p['min_qty']:g} / макс {p['max_qty']:g} {p['unit']}")
     await cb.message.answer("📋 <b>Текущий каталог:</b>\n" + "\n".join(lines), parse_mode="HTML")
     await cb.answer()
+
+
+@router.callback_query(F.data == "admin:reminder")
+async def admin_reminder_start(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    point = db.get_point(data["point_id"])
+    current = f"сейчас: {point['reminder_time']}" if point["reminder_time"] else "сейчас выключено"
+    recipient = "чат заказа этой точки" if not point["reminder_chat_id"] else f"отдельный чат ({point['reminder_chat_id']})"
+    await cb.message.edit_text(
+        f"⏰ Напоминание, если к этому времени остатки ещё не заполнены ({current}).\n"
+        f"Получатель: {recipient} — сменить получателя можно позже, сейчас не спрашиваю.\n\n"
+        f"Введите время в формате <code>ЧЧ:ММ</code> (например 10:00), "
+        f"или «-», чтобы выключить напоминание для этой точки:",
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminForm.set_reminder_time)
+    await cb.answer()
+
+
+@router.message(AdminForm.set_reminder_time)
+async def admin_reminder_set(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    data = await state.get_data()
+
+    if text == "-":
+        db.set_reminder(data["point_id"], None)
+        await message.answer("Напоминание для этой точки выключено.")
+        await show_admin_menu(message, state)
+        return
+
+    m = re.match(r"^([0-9]|[01]\d|2[0-3]):([0-5]\d)$", text)
+    if not m:
+        await message.answer("Неверный формат. Нужно ЧЧ:ММ, например 10:00 или 9:30, или «-» чтобы выключить. Введите ещё раз:")
+        return
+    normalized = f"{int(m.group(1)):02d}:{m.group(2)}"
+
+    db.set_reminder(data["point_id"], normalized)
+    await message.answer(f"Готово. Напоминание в {normalized}, если к этому времени остатки не заполнены.")
+    await show_admin_menu(message, state)
 
 
 # ---- добавить категорию ----
@@ -758,6 +962,56 @@ async def admin_confirm_delete(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+async def setup_commands(bot: Bot):
+    default_commands = [
+        BotCommand(command="start", description="Начать / выбрать точку и заполнить остатки"),
+        BotCommand(command="help", description="Как пользоваться ботом"),
+    ]
+    await bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+
+    admin_commands = default_commands + [
+        BotCommand(command="admin", description="Админ-панель: категории, позиции, мин/макс"),
+    ]
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            pass  # админ ещё не писал боту — Telegram не даст выставить меню для этого chat_id, это ок
+
+
+async def reminder_loop(bot: Bot):
+    """Раз в минуту проверяет точки с включённым напоминанием: если наступило заданное
+    время и по точке сегодня ещё никто не заполнял остатки — шлёт напоминание."""
+    while True:
+        try:
+            now = datetime.now()
+            current_hm = now.strftime("%H:%M")
+            today = now.strftime("%Y-%m-%d")
+            for point in db.points_with_reminders():
+                if point["reminder_time"] != current_hm:
+                    continue
+                if db.was_reminder_sent(point["id"], today):
+                    continue
+                db.mark_reminder_sent(point["id"], today)  # помечаем сразу, чтобы не отправить дважды
+                if db.has_entries_today(point["id"], today):
+                    continue  # уже заполняли сегодня — напоминать не о чем
+                target = point["reminder_chat_id"] or point["chat_id"]
+                if not target:
+                    print(f"⚠️  У точки «{point['name']}» не задан чат для напоминания — пропускаю.")
+                    continue
+                try:
+                    await bot.send_message(
+                        target,
+                        f"⏰ Напоминание: сегодня ещё не заполнены остатки по точке «{point['name']}».\n"
+                        f"Наберите /start, чтобы заполнить.",
+                    )
+                except Exception as e:
+                    print(f"⚠️  Не удалось отправить напоминание для «{point['name']}»: {e}")
+        except Exception as e:
+            print(f"⚠️  Ошибка в reminder_loop: {e}")
+        await asyncio.sleep(60)
+
+
 async def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -767,8 +1021,10 @@ async def main():
               "Укажите ADMIN_IDS=id1,id2 в переменных окружения для продакшена.")
     db.init_db()
     bot = Bot(token)
+    await setup_commands(bot)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    asyncio.create_task(reminder_loop(bot))
     await dp.start_polling(bot)
 
 
