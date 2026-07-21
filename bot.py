@@ -207,15 +207,20 @@ async def cmd_help(message: Message):
     await message.answer(INTRO_TEXT, parse_mode="HTML")
 
 
+def admin_points_keyboard():
+    kb = points_keyboard(prefix="adminpoint")
+    kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Новая точка", callback_data="adminpoint:NEW")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="📥 Импорт из seed_products.xlsx", callback_data="admin:reimport")])
+    return kb
+
+
 async def do_admin(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда доступна только администраторам.")
         return
     await state.clear()
     await message.answer("🛠 Админ-панель", reply_markup=main_reply_keyboard(message.from_user.id))
-    kb = points_keyboard(prefix="adminpoint")
-    kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Новая точка", callback_data="adminpoint:NEW")])
-    await message.answer("Выберите точку для редактирования каталога:", reply_markup=kb)
+    await message.answer("Выберите точку для редактирования каталога:", reply_markup=admin_points_keyboard())
     await state.set_state(AdminForm.picking_point)
 
 
@@ -558,6 +563,7 @@ def admin_menu_keyboard():
         [InlineKeyboardButton(text="✏️ Переименовать категорию", callback_data="admin:rename_category")],
         [InlineKeyboardButton(text="🗑 Удалить позицию", callback_data="admin:delete_product")],
         [InlineKeyboardButton(text="🗑 Удалить категорию", callback_data="admin:delete_category")],
+        [InlineKeyboardButton(text="🗑 Удалить точку целиком", callback_data="admin:delete_point")],
         [InlineKeyboardButton(text="⏰ Напоминание", callback_data="admin:reminder")],
         [InlineKeyboardButton(text="📋 Показать каталог", callback_data="admin:show_catalog")],
         [InlineKeyboardButton(text="⬅️ Сменить точку", callback_data="admin:back_points")],
@@ -629,9 +635,7 @@ async def show_admin_menu(message: Message, state: FSMContext, edit: bool = Fals
 @router.callback_query(F.data == "admin:back_points")
 async def admin_back_points(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    kb = points_keyboard(prefix="adminpoint")
-    kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Новая точка", callback_data="adminpoint:NEW")])
-    await cb.message.edit_text("Выберите точку для редактирования каталога:", reply_markup=kb)
+    await cb.message.edit_text("Выберите точку для редактирования каталога:", reply_markup=admin_points_keyboard())
     await state.set_state(AdminForm.picking_point)
     await cb.answer()
 
@@ -942,6 +946,36 @@ async def admin_delete_category_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+@router.callback_query(F.data == "admin:reimport")
+async def admin_reimport_start(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(pending_action="reimport_excel")
+    await cb.message.edit_text(
+        "📥 Загрузить каталог из seed_products.xlsx?\n\n"
+        "⚠️ Для каждой точки, перечисленной на листе «Точки» этого файла, "
+        "её текущие категории и позиции будут <b>полностью заменены</b> тем, "
+        "что в файле — включая всё, что вы добавляли через /admin вручную. "
+        "Точки, которых нет в файле, не затронутся.",
+        reply_markup=confirm_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminForm.confirm_delete)
+    await cb.answer()
+
+
+@router.callback_query(AdminForm.menu, F.data == "admin:delete_point")
+async def admin_delete_point_start(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    point = db.get_point(data["point_id"])
+    await state.update_data(pending_action="delete_point")
+    await cb.message.edit_text(
+        f"Удалить точку «{point['name']}» целиком — вместе со всеми категориями, "
+        f"позициями и историей остатков? Это необратимо.",
+        reply_markup=confirm_keyboard(),
+    )
+    await state.set_state(AdminForm.confirm_delete)
+    await cb.answer()
+
+
 @router.callback_query(AdminForm.confirm_delete, F.data.startswith("admconfirm:"))
 async def admin_confirm_delete(cb: CallbackQuery, state: FSMContext):
     answer = cb.data.split(":")[1]
@@ -956,6 +990,35 @@ async def admin_confirm_delete(cb: CallbackQuery, state: FSMContext):
             product = db.get_product(data["product_id"])
             db.delete_product(data["product_id"])
             await cb.message.edit_text(f"Позиция «{product['name']}» удалена.")
+        elif action == "delete_point":
+            point = db.get_point(data["point_id"])
+            db.delete_point(data["point_id"])
+            await cb.message.edit_text(f"Точка «{point['name']}» удалена целиком.")
+            await state.clear()
+            await cb.message.answer("Выберите точку для редактирования каталога:", reply_markup=admin_points_keyboard())
+            await state.set_state(AdminForm.picking_point)
+            await cb.answer()
+            return
+        elif action == "reimport_excel":
+            seed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed_products.xlsx")
+            try:
+                import import_products
+                result = import_products.main(seed_path)
+                text = f"✅ Импорт завершён. Точек: {result['points']}, позиций: {result['products']}."
+                if result["skipped"]:
+                    text += f"\n\n⚠️ Пропущено строк: {len(result['skipped'])}:\n" + "\n".join(
+                        f"• {s}" for s in result["skipped"][:10]
+                    )
+                    if len(result["skipped"]) > 10:
+                        text += f"\n…и ещё {len(result['skipped']) - 10}"
+                await cb.message.edit_text(text)
+            except Exception as e:
+                await cb.message.edit_text(f"⚠️ Не удалось выполнить импорт: {e}")
+            await state.clear()
+            await cb.message.answer("Выберите точку для редактирования каталога:", reply_markup=admin_points_keyboard())
+            await state.set_state(AdminForm.picking_point)
+            await cb.answer()
+            return
     else:
         await cb.message.edit_text("Отменено.")
     await show_admin_menu(cb.message, state)

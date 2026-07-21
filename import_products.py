@@ -35,6 +35,7 @@ def main(path: str = "seed_products.xlsx"):
     ws_prod = wb["Позиции"]
     sort_counters = {}
     added = 0
+    skipped = []
     for row in ws_prod.iter_rows(min_row=5, values_only=True):
         point_name, category, name, unit, min_qty, max_qty = (row + (None,) * 6)[:6]
         if not point_name or not name:
@@ -42,9 +43,11 @@ def main(path: str = "seed_products.xlsx"):
         point_name = str(point_name).strip()
         if point_name not in point_ids:
             print(f"  ! Точка «{point_name}» не найдена на листе «Точки» — строка пропущена: {name}")
+            skipped.append(f"«{name}» — точка «{point_name}» не найдена")
             continue
         if min_qty is None or max_qty is None:
             print(f"  ! Пропущена позиция без мин/макс: {name}")
+            skipped.append(f"«{name}» — не указан мин/макс")
             continue
         point_id = point_ids[point_name]
         category_name = str(category).strip() if category else "БЕЗ КАТЕГОРИИ"
@@ -65,6 +68,7 @@ def main(path: str = "seed_products.xlsx"):
         added += 1
 
     print(f"\nГотово. Загружено позиций: {added}")
+    return {"points": len(point_ids), "products": added, "skipped": skipped}
 
 
 if __name__ == "__main__":

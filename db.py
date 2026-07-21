@@ -136,6 +136,12 @@ def create_point(name: str):
         return cur.lastrowid
 
 
+def delete_point(point_id: int):
+    """Удаляет точку целиком — категории и позиции удалятся каскадно (ON DELETE CASCADE)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM points WHERE id = ?", (point_id,))
+
+
 # ---------- Categories ----------
 
 def clear_categories_for_point(point_id: int):
