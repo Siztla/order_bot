@@ -1020,6 +1020,23 @@ async def main():
         print("⚠️  ADMIN_IDS не задан — команда /admin будет доступна ВСЕМ. "
               "Укажите ADMIN_IDS=id1,id2 в переменных окружения для продакшена.")
     db.init_db()
+
+    if not db.list_points():
+        seed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed_products.xlsx")
+        if os.path.exists(seed_path):
+            print(f"⚠️  Каталог пуст (похоже, база сбросилась при деплое) — "
+                  f"автоматически восстанавливаю из {seed_path}...")
+            try:
+                import import_products
+                import_products.main(seed_path)
+                print("✅ Каталог восстановлен из seed_products.xlsx.")
+            except Exception as e:
+                print(f"⚠️  Не удалось автоматически восстановить каталог: {e}. "
+                      f"Создайте точки вручную через /admin.")
+        else:
+            print("⚠️  Каталог пуст, и seed_products.xlsx не найден рядом с bot.py — "
+                  "создайте точки вручную через /admin.")
+
     bot = Bot(token)
     await setup_commands(bot)
     dp = Dispatcher(storage=MemoryStorage())
