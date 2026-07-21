@@ -7,11 +7,19 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
-# Путь к файлу базы. По умолчанию — рядом с кодом (не переживает передеплой на
-# хостингах без постоянного диска). Если у хостинга есть Volume/постоянное
-# хранилище, задайте переменную окружения DB_PATH, указывающую внутрь него,
-# например: DB_PATH=/data/order_bot.db — тогда база переживёт пересборку.
-DB_PATH = os.environ.get("DB_PATH", "order_bot.db")
+# Путь к файлу базы. Порядок:
+# 1) DB_PATH, если задан явно — полный путь к файлу базы.
+# 2) Иначе DATA_DIR/order_bot.db — так рекомендует bothost.ru: папка DATA_DIR
+#    (по умолчанию /app/data) сохраняется между перезапусками/деплоями.
+# 3) Если ни то ни другое не задано (например, при локальном запуске на Mac) —
+#    просто "order_bot.db" рядом с кодом, как раньше.
+DATA_DIR = os.environ.get("DATA_DIR")
+if os.environ.get("DB_PATH"):
+    DB_PATH = os.environ["DB_PATH"]
+elif DATA_DIR:
+    DB_PATH = os.path.join(DATA_DIR, "order_bot.db")
+else:
+    DB_PATH = "order_bot.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS points (
