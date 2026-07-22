@@ -64,6 +64,24 @@ CREATE TABLE IF NOT EXISTS reminder_log (
     sent_date TEXT NOT NULL,       -- 'YYYY-MM-DD'
     PRIMARY KEY (point_id, sent_date)
 );
+
+CREATE TABLE IF NOT EXISTS recipes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    category TEXT,                 -- произвольная группа для навигации, например "Супы"; может быть NULL
+    method TEXT,                   -- способ приготовления, пошагово, свободный текст
+    photo_file_id TEXT,            -- Telegram file_id фото готового блюда; может быть NULL
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS recipe_ingredients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_id INTEGER NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    amount REAL,                   -- может быть NULL, если количество не числовое ("по вкусу")
+    unit TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
 """
 
 MIGRATIONS = [
@@ -339,3 +357,52 @@ def mark_reminder_sent(point_id: int, date_str: str):
             "INSERT OR IGNORE INTO reminder_log (point_id, sent_date) VALUES (?, ?)",
             (point_id, date_str),
         )
+
+
+# ---------- Тех.карты (рецепты) ----------
+
+def create_recipe(name: str, category: str, method: str) -> int:
+    with get_conn() as conn:
+        max_sort = conn.execute("SELECT COALESCE(MAX(sort_order), -1) m FROM recipes").fetchone()["m"]
+        cur = conn.execute(
+            "INSERT INTO recipes (name, category, method, sort_order) VALUES (?, ?, ?, ?)",
+            (name.strip(), (category or "").strip() or None, method.strip(), max_sort + 1),
+        )
+        return cur.lastrowid
+
+
+def add_recipe_ingredient(recipe_id: int, name: str, amount, unit: str, sort_order: int):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO recipe_ingredients (recipe_id, name, amount, unit, sort_order)
+               VALUES (?, ?, ?, ?, ?)""",
+            (recipe_id, name.strip(), amount, (unit or "").strip() or None, sort_order),
+        )
+
+
+def list_recipes():
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM recipes ORDER BY sort_order, name").fetchall()
+
+
+def get_recipe(recipe_id: int):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM recipes WHERE id = ?", (recipe_id,)).fetchone()
+
+
+def list_recipe_ingredients(recipe_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM recipe_ingredients WHERE recipe_id = ? ORDER BY sort_order, name",
+            (recipe_id,),
+        ).fetchall()
+
+
+def set_recipe_photo(recipe_id: int, file_id):
+    with get_conn() as conn:
+        conn.execute("UPDATE recipes SET photo_file_id = ? WHERE id = ?", (file_id, recipe_id))
+
+
+def delete_recipe(recipe_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))

@@ -58,10 +58,14 @@ START_TRIGGERS = {
     "📦 заполнить остатки",
 }
 ADMIN_TRIGGERS = {"админ", "admin", "панель", "админка", "админ-панель", "⚙️ админ-панель"}
+RECIPE_TRIGGERS = {"рецепты", "рецепт", "техкарты", "техкарта", "тех.карты", "тех.карта", "📖 тех.карты"}
 
 
 def main_reply_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton(text="📦 Заполнить остатки")]]
+    rows = [
+        [KeyboardButton(text="📦 Заполнить остатки")],
+        [KeyboardButton(text="📖 Тех.карты")],
+    ]
     if is_admin(user_id):
         rows.append([KeyboardButton(text="⚙️ Админ-панель")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -76,8 +80,13 @@ class OrderForm(StatesGroup):
     choosing_point = State()
     choosing_category = State()
     filling = State()
+    manual_entry = State()
     reviewing = State()
     editing_single = State()
+
+
+class PointHub(StatesGroup):
+    menu = State()
 
 
 def status_icon(fact: float, min_qty: float, max_qty: float) -> str:
@@ -109,12 +118,8 @@ def categories_keyboard(categories):
     kb = [[InlineKeyboardButton(text="📦 Все категории", callback_data="cat:ALL")]]
     for c in categories:
         kb.append([InlineKeyboardButton(text=c["name"], callback_data=f"cat:{c['id']}")])
-    kb.append([InlineKeyboardButton(text="🏠 Сменить точку", callback_data="back:points")])
+    kb.append([InlineKeyboardButton(text="⬅️ Меню точки", callback_data="hub:back")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-def category_form_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[nav_row()])
 
 
 def review_keyboard():
@@ -159,12 +164,13 @@ async def nav_back_categories(cb: CallbackQuery, state: FSMContext):
 INTRO_TEXT = (
     "👋 <b>Как это работает</b>\n"
     "1️⃣ Выбираете точку\n"
-    "2️⃣ Выбираете категорию (или «Все категории»)\n"
-    "3️⃣ Бот присылает список позиций — отвечаете <b>одним сообщением</b>: "
-    "числа по порядку, каждое на новой строке, столько же чисел, сколько позиций\n"
-    "4️⃣ Бот сам считает, что нужно заказать, и показывает сводку\n"
-    "5️⃣ Проверяете и жмёте «Отправить»\n\n"
-    "❗️Вписываете не «сколько заказать», а <b>сколько сейчас есть по факту</b> — "
+    "2️⃣ В меню точки — «📦 Заказ остатков» или «📖 Тех.карты»\n"
+    "3️⃣ Для заказа: выбираете категорию (или «Все категории» — бот сам объявит, когда перейдёт к следующей)\n"
+    "4️⃣ Бот показывает позиции по одной — жмёте +1/+5/+10 или −1/−5/−10, "
+    "либо «🔢 Ввести число» для точного значения, затем «✅ Далее»\n"
+    "5️⃣ Бот сам считает, что нужно заказать, и показывает сводку\n"
+    "6️⃣ Проверяете и жмёте «Отправить»\n\n"
+    "❗️Указываете не «сколько заказать», а <b>сколько сейчас есть по факту</b> — "
     "заказ бот посчитает сам.\n\n"
     "🧭 Ошиблись с точкой или категорией? На каждом шаге есть кнопки "
     "«⬅️ Категории» и «🏠 Точки» — вернут назад, ничего не отменяя.\n"
@@ -211,6 +217,7 @@ def admin_points_keyboard():
     kb = points_keyboard(prefix="adminpoint")
     kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Новая точка", callback_data="adminpoint:NEW")])
     kb.inline_keyboard.append([InlineKeyboardButton(text="📥 Импорт из seed_products.xlsx", callback_data="admin:reimport")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="📖 Тех.карты", callback_data="admin:recipes")])
     return kb
 
 
@@ -234,6 +241,77 @@ async def admin_trigger(message: Message, state: FSMContext):
     await do_admin(message, state)
 
 
+# ============================================================================
+#  ТЕХ.КАРТЫ (просмотр — доступен всем; редактирование — см. блок АДМИН-ПАНЕЛЬ)
+# ============================================================================
+
+
+class RecipeView(StatesGroup):
+    browsing = State()
+
+
+def recipe_list_keyboard(recipes):
+    kb = [[InlineKeyboardButton(text=r["name"], callback_data=f"recipe:{r['id']}")] for r in recipes]
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="hub:back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def format_recipe_card(recipe, ingredients) -> str:
+    title = recipe["name"]
+    if recipe["category"]:
+        title += f" ({recipe['category']})"
+    lines = [f"🍲 <b>{title}</b>", "", "<b>Ингредиенты:</b>"]
+    for ing in ingredients:
+        if ing["amount"] is not None:
+            amount_str = f"{ing['amount']:g}"
+            if ing["unit"]:
+                amount_str += f" {ing['unit']}"
+        else:
+            amount_str = ing["unit"] or ""
+        lines.append(f"• {ing['name']} — {amount_str}" if amount_str else f"• {ing['name']}")
+    if recipe["method"]:
+        lines.append("")
+        lines.append("<b>Способ приготовления:</b>")
+        lines.append(recipe["method"])
+    return "\n".join(lines)
+
+
+async def do_recipes(message: Message, state: FSMContext, user_id: int = None):
+    user_id = user_id if user_id is not None else message.from_user.id
+    recipes = db.list_recipes()
+    if not recipes:
+        await message.answer(
+            "Тех.карт пока нет." + (" Добавить можно через /admin." if is_admin(user_id) else "")
+        )
+        return
+    await message.answer("📖 Выберите блюдо:", reply_markup=recipe_list_keyboard(recipes))
+    await state.set_state(RecipeView.browsing)
+
+
+@router.message(Command("recipes"))
+async def cmd_recipes(message: Message, state: FSMContext):
+    await do_recipes(message, state)
+
+
+@router.message(F.text.func(lambda t: t and t.strip().lower() in RECIPE_TRIGGERS))
+async def recipes_trigger(message: Message, state: FSMContext):
+    await do_recipes(message, state)
+
+
+@router.callback_query(RecipeView.browsing, F.data.startswith("recipe:"))
+async def recipe_selected(cb: CallbackQuery, state: FSMContext):
+    recipe_id = int(cb.data.split(":")[1])
+    recipe = db.get_recipe(recipe_id)
+    if not recipe:
+        await cb.answer("Рецепт не найден — возможно, его удалили.", show_alert=True)
+        return
+    ingredients = db.list_recipe_ingredients(recipe_id)
+    if recipe["photo_file_id"]:
+        await cb.message.answer_photo(recipe["photo_file_id"])
+    await cb.message.answer(format_recipe_card(recipe, ingredients), parse_mode="HTML")
+    await cb.answer()
+
+
 @router.callback_query(F.data == "back:points")
 async def back_to_points(cb: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -242,22 +320,95 @@ async def back_to_points(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+def point_hub_keyboard():
+    kb = [
+        [InlineKeyboardButton(text="📦 Заказ остатков", callback_data="hub:order")],
+        [InlineKeyboardButton(text="📖 Тех.карты", callback_data="hub:recipes")],
+        [InlineKeyboardButton(text="🏠 Сменить точку", callback_data="back:points")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
 @router.callback_query(OrderForm.choosing_point, F.data.startswith("point:"))
 async def point_chosen(cb: CallbackQuery, state: FSMContext):
     point_id = int(cb.data.split(":")[1])
     point = db.get_point(point_id)
+    await state.update_data(point_id=point_id, point_name=point["name"])
+    await cb.message.edit_text(
+        f"Точка: <b>{point['name']}</b>\nЧто делаем?",
+        reply_markup=point_hub_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(PointHub.menu)
+    await cb.answer()
+
+
+@router.callback_query(PointHub.menu, F.data == "hub:order")
+async def hub_order(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    point_id = data["point_id"]
     categories = categories_with_products(point_id)
     if not categories:
         await cb.answer("У этой точки пока нет ни одной позиции в каталоге.", show_alert=True)
         return
-    await state.update_data(point_id=point_id, point_name=point["name"])
     await cb.message.edit_text(
-        f"Точка: <b>{point['name']}</b>\nЧто заполняем — все позиции или одну категорию?",
+        f"Точка: <b>{data['point_name']}</b>\nЧто заполняем — все позиции или одну категорию?",
         reply_markup=categories_keyboard(categories),
         parse_mode="HTML",
     )
     await state.set_state(OrderForm.choosing_category)
     await cb.answer()
+
+
+@router.callback_query(PointHub.menu, F.data == "hub:recipes")
+async def hub_recipes(cb: CallbackQuery, state: FSMContext):
+    await do_recipes(cb.message, state, user_id=cb.from_user.id)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "hub:back")
+async def hub_back(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    point_id = data.get("point_id")
+    if not point_id:
+        await back_to_points(cb, state)
+        return
+    await cb.message.edit_text(
+        f"Точка: <b>{data['point_name']}</b>\nЧто делаем?",
+        reply_markup=point_hub_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(PointHub.menu)
+    await cb.answer()
+
+
+def item_keyboard(show_back: bool):
+    kb = [
+        [
+            InlineKeyboardButton(text="−10", callback_data="qty:-10"),
+            InlineKeyboardButton(text="−5", callback_data="qty:-5"),
+            InlineKeyboardButton(text="−1", callback_data="qty:-1"),
+            InlineKeyboardButton(text="+1", callback_data="qty:+1"),
+            InlineKeyboardButton(text="+5", callback_data="qty:+5"),
+            InlineKeyboardButton(text="+10", callback_data="qty:+10"),
+        ],
+        [InlineKeyboardButton(text="🔢 Ввести число", callback_data="qty:manual")],
+        [InlineKeyboardButton(text="✅ Далее", callback_data="qty:next")],
+    ]
+    if show_back:
+        kb.append([InlineKeyboardButton(text="⬅️ Предыдущая позиция", callback_data="qty:back")])
+    kb.append(nav_row())
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def render_item_text(product, current_value: float, position_no: int, total: int) -> str:
+    lines = [
+        f"({position_no}/{total}) <b>{product['name']}</b>",
+        f"Мин {product['min_qty']:g} / Макс {product['max_qty']:g} {product['unit']}",
+        "",
+        f"Сейчас указано: <b>{current_value:g}</b> {product['unit']}",
+    ]
+    return "\n".join(lines)
 
 
 @router.callback_query(OrderForm.choosing_category, F.data.startswith("cat:"))
@@ -276,124 +427,113 @@ async def category_chosen(cb: CallbackQuery, state: FSMContext):
     await state.update_data(
         category_label=category_label,
         product_ids=[p["id"] for p in products],
+        index=0,
         answers={},
+        current_value=None,
+        last_shown_category=None,
     )
     await cb.message.edit_text(f"Заполняем: <b>{category_label}</b>", parse_mode="HTML")
     await state.set_state(OrderForm.filling)
-    await send_category_form(cb.message, state)
+    await advance_to_item(cb.message, state)
     await cb.answer()
 
 
-def format_category_form(products, last_facts=None) -> str:
-    last_facts = last_facts or {}
-    lines = [
-        "📝 Впишите факт по каждой позиции <b>одним сообщением</b>:",
-        "каждое число — на новой строке, по порядку, без нумерации.",
-        "",
-    ]
-    has_history = False
-    for i, p in enumerate(products, 1):
-        last = last_facts.get(p["id"])
-        suffix = ""
-        if last is not None:
-            has_history = True
-            suffix = f" <i>(в прошлый раз: {last:g})</i>"
-        lines.append(f"{i}. {p['name']} — мин {p['min_qty']:g} / макс {p['max_qty']:g} {p['unit']}{suffix}")
-
-    if has_history:
-        lines.append("")
-        lines.append("🔁 Если по позиции ничего не изменилось — вместо числа поставьте <code>=</code>, "
-                      "бот возьмёт значение из прошлого раза.")
-
-    example_n = min(2, len(products))
-    example_products = products[:example_n]
-    example_values = [max(round((p["min_qty"] + p["max_qty"]) / 2), 1) for p in example_products]
-
-    lines.append("")
-    lines.append("💡 <b>Пример:</b> если сейчас")
-    for p, v in zip(example_products, example_values):
-        lines.append(f"• {p['name']} — {v:g} {p['unit']}")
-    if len(products) > example_n:
-        lines.append(f"• …а по остальным {len(products) - example_n} позициям — свои числа")
-    lines.append("то ваш ответ начинается так:")
-    lines.append("<code>" + "\n".join(f"{v:g}" for v in example_values) + ("\n…" if len(products) > example_n else "") + "</code>")
-
-    return "\n".join(lines)
-
-
-async def send_category_form(message: Message, state: FSMContext):
+async def advance_to_item(message: Message, state: FSMContext):
+    """Показывает экран текущей позиции (index в state), объявляя смену категории,
+    если сотрудник перешёл в другую категорию (актуально для «Все категории»)."""
     data = await state.get_data()
+    idx = data["index"]
     product_ids = data["product_ids"]
-    products = [db.get_product(pid) for pid in product_ids]
-    last_facts = db.last_facts_for(product_ids)
+
+    if idx >= len(product_ids):
+        await show_review(message, state)
+        return
+
+    product = db.get_product(product_ids[idx])
+
+    if idx > 0 and data.get("last_shown_category") != product["category_name"]:
+        await message.answer(f"📍 <b>{product['category_name']}</b>", parse_mode="HTML")
+    await state.update_data(last_shown_category=product["category_name"])
+
+    answers = data["answers"]
+    if str(product["id"]) in answers:
+        current_value = answers[str(product["id"])]
+    else:
+        last_fact = db.last_facts_for([product["id"]]).get(product["id"])
+        current_value = last_fact if last_fact is not None else 0
+    await state.update_data(current_value=current_value)
+
     await message.answer(
-        format_category_form(products, last_facts), parse_mode="HTML", reply_markup=category_form_keyboard()
+        render_item_text(product, current_value, idx + 1, len(product_ids)),
+        parse_mode="HTML",
+        reply_markup=item_keyboard(show_back=idx > 0),
     )
 
 
-def parse_bulk_numbers(text: str, expected: int, last_values=None):
-    """Пытается разобрать текст в список из `expected` чисел ≥ 0.
-    Токен '=' означает «взять значение из прошлого раза» (last_values[i]), если оно известно.
-    Сначала пробует по строкам, затем — по пробелам. Возвращает (numbers, error)."""
-    last_values = last_values or [None] * expected
-    for splitter in (lambda t: [l.strip() for l in t.splitlines() if l.strip()],
-                      lambda t: t.split()):
-        tokens = splitter(text)
-        if len(tokens) != expected:
-            continue
-        numbers = []
-        for i, tok in enumerate(tokens):
-            if tok == "=":
-                if last_values[i] is None:
-                    numbers = None
-                    break
-                numbers.append(last_values[i])
-                continue
-            tok_clean = tok.replace(",", ".")
-            m = re.match(r"^\d+[.)]\s*(.+)$", tok_clean)  # снять нумерацию "1." если её вписали
-            if m:
-                tok_clean = m.group(1)
-            try:
-                val = float(tok_clean)
-            except ValueError:
-                numbers = None
-                break
-            if val < 0:
-                numbers = None
-                break
-            numbers.append(val)
-        if numbers is not None:
-            return numbers, None
-    return None, expected
-
-
-@router.message(OrderForm.filling)
-async def receive_bulk_facts(message: Message, state: FSMContext):
+@router.callback_query(OrderForm.filling, F.data.startswith("qty:"))
+async def qty_button(cb: CallbackQuery, state: FSMContext):
+    action = cb.data.split(":", 1)[1]
     data = await state.get_data()
+    idx = data["index"]
     product_ids = data["product_ids"]
-    expected = len(product_ids)
-    last_facts = db.last_facts_for(product_ids)
-    last_values = [last_facts.get(pid) for pid in product_ids]
+    product = db.get_product(product_ids[idx])
 
-    numbers, expected_count = parse_bulk_numbers(message.text or "", expected, last_values)
-    if numbers is None:
-        got = len((message.text or "").split()) if "\n" not in (message.text or "").strip() else len([l for l in (message.text or "").splitlines() if l.strip()])
-        await message.answer(
-            f"⚠️ Не получилось разобрать числа: похоже, их {got}, а нужно ровно "
-            f"<b>{expected_count}</b> — по одному на каждую позицию ниже, каждое ≥ 0 (или <code>=</code>, "
-            f"если для позиции есть значение из прошлого раза).\n"
-            f"Отправьте ещё раз одним сообщением, число на новой строке:",
-            parse_mode="HTML",
+    if action == "manual":
+        await cb.message.edit_text(
+            f"«{product['name']}»\nВведите число ({product['unit']}, ≥ 0):",
         )
-        products = [db.get_product(pid) for pid in product_ids]
-        await message.answer(
-            format_category_form(products, last_facts), parse_mode="HTML", reply_markup=category_form_keyboard()
-        )
+        await state.set_state(OrderForm.manual_entry)
+        await cb.answer()
         return
 
-    answers = {str(pid): val for pid, val in zip(product_ids, numbers)}
-    await state.update_data(answers=answers)
-    await show_review(message, state)
+    if action == "back":
+        if idx > 0:
+            answers = data["answers"]
+            answers.pop(str(product_ids[idx - 1]), None)
+            await state.update_data(index=idx - 1, answers=answers)
+            await advance_to_item(cb.message, state)
+        await cb.answer()
+        return
+
+    if action == "next":
+        answers = data["answers"]
+        answers[str(product["id"])] = data["current_value"]
+        await state.update_data(answers=answers, index=idx + 1)
+        await advance_to_item(cb.message, state)
+        await cb.answer()
+        return
+
+    # действия +N / -N
+    delta = float(action)
+    new_value = max(0, data["current_value"] + delta)
+    await state.update_data(current_value=new_value)
+    await cb.message.edit_text(
+        render_item_text(product, new_value, idx + 1, len(product_ids)),
+        parse_mode="HTML",
+        reply_markup=item_keyboard(show_back=idx > 0),
+    )
+    await cb.answer()
+
+
+@router.message(OrderForm.manual_entry)
+async def receive_manual_value(message: Message, state: FSMContext):
+    text = (message.text or "").strip().replace(",", ".")
+    try:
+        val = float(text)
+        if val < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Нужно число ≥ 0, например: 6 или 4.5. Введите ещё раз:")
+        return
+
+    data = await state.get_data()
+    idx = data["index"]
+    product_ids = data["product_ids"]
+    answers = data["answers"]
+    answers[str(product_ids[idx])] = val
+    await state.update_data(answers=answers, index=idx + 1)
+    await state.set_state(OrderForm.filling)
+    await advance_to_item(message, state)
 
 
 async def show_review(message: Message, state: FSMContext):
@@ -429,10 +569,10 @@ async def show_review(message: Message, state: FSMContext):
 @router.callback_query(OrderForm.reviewing, F.data == "review:redo")
 async def review_redo(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    await state.update_data(answers={})
+    await state.update_data(answers={}, index=0, current_value=None, last_shown_category=None)
     await state.set_state(OrderForm.filling)
     await cb.message.edit_text(f"Заполняем заново: <b>{data['category_label']}</b>", parse_mode="HTML")
-    await send_category_form(cb.message, state)
+    await advance_to_item(cb.message, state)
     await cb.answer()
 
 
@@ -552,6 +692,17 @@ class AdminForm(StatesGroup):
     rename_category = State()
     confirm_delete = State()
     set_reminder_time = State()
+
+
+class RecipeAdminForm(StatesGroup):
+    menu = State()
+    add_name = State()
+    add_category = State()
+    add_ingredients = State()
+    add_method = State()
+    add_photo = State()
+    listing = State()
+    confirm_delete = State()
 
 
 def admin_menu_keyboard():
@@ -959,6 +1110,202 @@ async def admin_reimport_start(cb: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await state.set_state(AdminForm.confirm_delete)
+    await cb.answer()
+
+
+# ---- Тех.карты: управление (только админ) ----
+
+def recipe_admin_menu_keyboard():
+    kb = [
+        [InlineKeyboardButton(text="➕ Добавить рецепт", callback_data="radm:add")],
+        [InlineKeyboardButton(text="📋 Список / удалить", callback_data="radm:list")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:back_points")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def parse_ingredient_line(line: str):
+    """«Свёкла — 200 г» -> (Свёкла, 200.0, г). «Соль — по вкусу» -> (Соль, None, по вкусу).
+    «Укроп» (без разделителя) -> (Укроп, None, None)."""
+    line = line.strip()
+    if not line:
+        return None
+    parts = re.split(r"\s+—\s+|\s+-\s+", line, maxsplit=1)
+    if len(parts) != 2:
+        return (line, None, None)
+    name, rest = parts[0].strip(), parts[1].strip()
+    m = re.match(r"^([\d.,]+)\s*(.*)$", rest)
+    if m:
+        amount = float(m.group(1).replace(",", "."))
+        unit = m.group(2).strip() or None
+        return (name, amount, unit)
+    return (name, None, rest or None)
+
+
+def format_method(text: str) -> str:
+    """Если шаги уже пронумерованы — оставляет как есть, иначе нумерует сама."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    if all(re.match(r"^\d+[.)]", l) for l in lines):
+        return "\n".join(lines)
+    return "\n".join(f"{i}. {l}" for i, l in enumerate(lines, 1))
+
+
+@router.callback_query(F.data == "admin:recipes")
+async def admin_recipes_menu(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Только для администраторов.", show_alert=True)
+        return
+    await cb.message.edit_text("📖 Тех.карты — управление", reply_markup=recipe_admin_menu_keyboard())
+    await state.set_state(RecipeAdminForm.menu)
+    await cb.answer()
+
+
+@router.callback_query(RecipeAdminForm.menu, F.data == "radm:add")
+async def radm_add_start(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("Введите название блюда:")
+    await state.set_state(RecipeAdminForm.add_name)
+    await cb.answer()
+
+
+@router.message(RecipeAdminForm.add_name)
+async def radm_add_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Название не может быть пустым. Введите ещё раз:")
+        return
+    await state.update_data(new_name=name)
+    await message.answer("Категория для навигации (например «Супы»), или «-» если без категории:")
+    await state.set_state(RecipeAdminForm.add_category)
+
+
+@router.message(RecipeAdminForm.add_category)
+async def radm_add_category(message: Message, state: FSMContext):
+    category = (message.text or "").strip()
+    category = "" if category == "-" else category
+    await state.update_data(new_category=category)
+    await message.answer(
+        "Ингредиенты — по одному на строку, в формате «Название — количество ед»:\n"
+        "<code>Свёкла — 200 г\nКапуста — 150 г\nСоль — по вкусу</code>",
+        parse_mode="HTML",
+    )
+    await state.set_state(RecipeAdminForm.add_ingredients)
+
+
+@router.message(RecipeAdminForm.add_ingredients)
+async def radm_add_ingredients(message: Message, state: FSMContext):
+    lines = (message.text or "").splitlines()
+    parsed = [parse_ingredient_line(l) for l in lines]
+    parsed = [p for p in parsed if p]
+    if not parsed:
+        await message.answer("Не нашёл ни одной строки с ингредиентом. Введите ещё раз, каждый на новой строке:")
+        return
+    await state.update_data(new_ingredients=parsed)
+    await message.answer("Способ приготовления — по шагам (каждый шаг на новой строке, нумеровать не обязательно):")
+    await state.set_state(RecipeAdminForm.add_method)
+
+
+@router.message(RecipeAdminForm.add_method)
+async def radm_add_method(message: Message, state: FSMContext):
+    method = format_method(message.text or "")
+    if not method:
+        await message.answer("Нужен хотя бы один шаг. Введите ещё раз:")
+        return
+    data = await state.get_data()
+    recipe_id = db.create_recipe(data["new_name"], data["new_category"], method)
+    for i, (ing_name, amount, unit) in enumerate(data["new_ingredients"]):
+        db.add_recipe_ingredient(recipe_id, ing_name, amount, unit, i)
+    await state.update_data(new_recipe_id=recipe_id)
+    await message.answer(
+        f"Рецепт «{data['new_name']}» сохранён.\n"
+        f"Пришлите фото готового блюда одним сообщением, или «-» чтобы пропустить:"
+    )
+    await state.set_state(RecipeAdminForm.add_photo)
+
+
+@router.message(RecipeAdminForm.add_photo, F.photo)
+async def radm_add_photo_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_id = message.photo[-1].file_id
+    db.set_recipe_photo(data["new_recipe_id"], file_id)
+    await message.answer("Фото добавлено. ✅")
+    await radm_back_to_menu(message, state)
+
+
+@router.message(RecipeAdminForm.add_photo)
+async def radm_add_photo_skip(message: Message, state: FSMContext):
+    if (message.text or "").strip() != "-":
+        await message.answer("Пришлите фото как изображение, или «-» чтобы пропустить:")
+        return
+    await radm_back_to_menu(message, state)
+
+
+async def radm_back_to_menu(message: Message, state: FSMContext):
+    await message.answer("📖 Тех.карты — управление", reply_markup=recipe_admin_menu_keyboard())
+    await state.set_state(RecipeAdminForm.menu)
+
+
+@router.callback_query(RecipeAdminForm.menu, F.data == "radm:list")
+async def radm_list(cb: CallbackQuery, state: FSMContext):
+    recipes = db.list_recipes()
+    if not recipes:
+        await cb.answer("Рецептов пока нет.", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton(text=r["name"], callback_data=f"radmview:{r['id']}")] for r in recipes]
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="radm:back")])
+    await cb.message.edit_text("Выберите рецепт:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await state.set_state(RecipeAdminForm.listing)
+    await cb.answer()
+
+
+@router.callback_query(RecipeAdminForm.menu, F.data == "radm:back")
+@router.callback_query(RecipeAdminForm.listing, F.data == "radm:back")
+async def radm_back(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("📖 Тех.карты — управление", reply_markup=recipe_admin_menu_keyboard())
+    await state.set_state(RecipeAdminForm.menu)
+    await cb.answer()
+
+
+@router.callback_query(RecipeAdminForm.listing, F.data.startswith("radmview:"))
+async def radm_view(cb: CallbackQuery, state: FSMContext):
+    recipe_id = int(cb.data.split(":")[1])
+    recipe = db.get_recipe(recipe_id)
+    ingredients = db.list_recipe_ingredients(recipe_id)
+    if recipe["photo_file_id"]:
+        await cb.message.answer_photo(recipe["photo_file_id"])
+    kb = [
+        [InlineKeyboardButton(text="🗑 Удалить рецепт", callback_data=f"radmdel:{recipe_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="radm:list")],
+    ]
+    await cb.message.answer(
+        format_recipe_card(recipe, ingredients), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+    await cb.answer()
+
+
+@router.callback_query(RecipeAdminForm.listing, F.data.startswith("radmdel:"))
+async def radm_delete_confirm(cb: CallbackQuery, state: FSMContext):
+    recipe_id = int(cb.data.split(":")[1])
+    recipe = db.get_recipe(recipe_id)
+    await state.update_data(delete_recipe_id=recipe_id)
+    await cb.message.edit_text(f"Удалить рецепт «{recipe['name']}»?", reply_markup=confirm_keyboard())
+    await state.set_state(RecipeAdminForm.confirm_delete)
+    await cb.answer()
+
+
+@router.callback_query(RecipeAdminForm.confirm_delete, F.data.startswith("admconfirm:"))
+async def radm_delete_execute(cb: CallbackQuery, state: FSMContext):
+    answer = cb.data.split(":")[1]
+    data = await state.get_data()
+    if answer == "yes":
+        recipe = db.get_recipe(data["delete_recipe_id"])
+        db.delete_recipe(data["delete_recipe_id"])
+        await cb.message.edit_text(f"Рецепт «{recipe['name']}» удалён.")
+    else:
+        await cb.message.edit_text("Отменено.")
+    await cb.message.answer("📖 Тех.карты — управление", reply_markup=recipe_admin_menu_keyboard())
+    await state.set_state(RecipeAdminForm.menu)
     await cb.answer()
 
 
