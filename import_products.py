@@ -1,15 +1,92 @@
 """
-Загружает каталог позиций из seed_products.xlsx в базу.
+Загружает каталог позиций, тех.карты и статьи обучения из seed_products.xlsx в базу.
 Запускать заново каждый раз, когда меняете точки/категории/позиции в Excel.
 (Если каталог уже отредактирован через бота — повторный запуск ПЕРЕЗАПИШЕТ
-его содержимым Excel-файла, будьте аккуратны.)
+его содержимым Excel-файла для точек/позиций; рецепты и статьи обучения —
+добавляются, уже существующие с тем же названием пропускаются, см. ниже.)
 
 Использование:
     python import_products.py [путь_к_файлу.xlsx]
 """
+import re
 import sys
 import openpyxl
 import db
+
+
+def parse_ingredient_line(line: str):
+    """«Свёкла — 200 г» -> (Свёкла, 200.0, г). «Соль — по вкусу» -> (Соль, None, по вкусу)."""
+    line = line.strip()
+    if not line:
+        return None
+    parts = re.split(r"\s+—\s+|\s+-\s+", line, maxsplit=1)
+    if len(parts) != 2:
+        return (line, None, None)
+    name, rest = parts[0].strip(), parts[1].strip()
+    m = re.match(r"^([\d.,]+)\s*(.*)$", rest)
+    if m:
+        amount = float(m.group(1).replace(",", "."))
+        unit = m.group(2).strip() or None
+        return (name, amount, unit)
+    return (name, None, rest or None)
+
+
+def format_method(text: str) -> str:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    if all(re.match(r"^\d+[.)]", l) for l in lines):
+        return "\n".join(lines)
+    return "\n".join(f"{i}. {l}" for i, l in enumerate(lines, 1))
+
+
+def import_recipes(wb) -> dict:
+    if "Рецепты" not in wb.sheetnames:
+        return {"added": 0, "skipped": 0}
+    ws = wb["Рецепты"]
+    existing = {(r["name"], r["category"] or "") for r in db.list_recipes()}
+    added = skipped = 0
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        name, category, ingredients_text, method_text = (row + (None,) * 4)[:4]
+        if not name:
+            continue
+        name = str(name).strip()
+        category = str(category).strip() if category else ""
+        if (name, category) in existing:
+            print(f"  ! Рецепт «{name}» ({category or 'без категории'}) уже есть — пропущен")
+            skipped += 1
+            continue
+        recipe_id = db.create_recipe(name, category, format_method(str(method_text or "")))
+        if ingredients_text:
+            for i, line in enumerate(str(ingredients_text).splitlines()):
+                parsed = parse_ingredient_line(line)
+                if parsed:
+                    ing_name, amount, unit = parsed
+                    db.add_recipe_ingredient(recipe_id, ing_name, amount, unit, i)
+        print(f"  Рецепт «{name}» добавлен")
+        added += 1
+    return {"added": added, "skipped": skipped}
+
+
+def import_kb(wb) -> dict:
+    if "Обучение" not in wb.sheetnames:
+        return {"added": 0, "skipped": 0}
+    ws = wb["Обучение"]
+    added = skipped = 0
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        section, title, body = (row + (None,) * 3)[:3]
+        if not section or not title:
+            continue
+        section, title = str(section).strip(), str(title).strip()
+        existing = [a for a in db.list_kb_articles(section) if a["title"] == title]
+        if existing:
+            print(f"  ! Статья «{title}» ({section}) уже есть — пропущена")
+            skipped += 1
+            continue
+        db.create_kb_article(section, title, str(body or "").strip())
+        print(f"  Статья «{title}» добавлена в «{section}»")
+        added += 1
+    return {"added": added, "skipped": skipped}
 
 
 def main(path: str = "seed_products.xlsx"):
@@ -68,7 +145,25 @@ def main(path: str = "seed_products.xlsx"):
         added += 1
 
     print(f"\nГотово. Загружено позиций: {added}")
-    return {"points": len(point_ids), "products": added, "skipped": skipped}
+
+    # --- Листы "Рецепты" и "Обучение" (опциональные) ---
+    recipes_result = import_recipes(wb)
+    if recipes_result["added"] or recipes_result["skipped"]:
+        print(f"Рецептов добавлено: {recipes_result['added']}, пропущено (уже есть): {recipes_result['skipped']}")
+
+    kb_result = import_kb(wb)
+    if kb_result["added"] or kb_result["skipped"]:
+        print(f"Статей обучения добавлено: {kb_result['added']}, пропущено (уже есть): {kb_result['skipped']}")
+
+    return {
+        "points": len(point_ids),
+        "products": added,
+        "skipped": skipped,
+        "recipes_added": recipes_result["added"],
+        "recipes_skipped": recipes_result["skipped"],
+        "kb_added": kb_result["added"],
+        "kb_skipped": kb_result["skipped"],
+    }
 
 
 if __name__ == "__main__":

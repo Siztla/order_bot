@@ -59,12 +59,25 @@ START_TRIGGERS = {
 }
 ADMIN_TRIGGERS = {"админ", "admin", "панель", "админка", "админ-панель", "⚙️ админ-панель"}
 RECIPE_TRIGGERS = {"рецепты", "рецепт", "техкарты", "техкарта", "тех.карты", "тех.карта", "📖 тех.карты"}
+RECIPE_CATEGORY_PRESETS = [
+    "Пельмени классические",
+    "Пельмени заварные",
+    "Вареники",
+    "Салаты",
+    "Супы",
+    "Горячее",
+    "Закуски",
+]
+KB_TRIGGERS = {"база знаний", "знания", "обучение", "санпин", "хранение", "маркировка", "📚 обучение", "📚 база знаний"}
+KB_SECTIONS = ["Обучение", "Хранение и маркировка", "СанПиН"]
+KB_SECTION_ICONS = {"Обучение": "📚", "Хранение и маркировка": "🧊", "СанПиН": "🧼"}
 
 
 def main_reply_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="📦 Заполнить остатки")],
         [KeyboardButton(text="📖 Тех.карты")],
+        [KeyboardButton(text="📚 Обучение")],
     ]
     if is_admin(user_id):
         rows.append([KeyboardButton(text="⚙️ Админ-панель")])
@@ -217,7 +230,9 @@ def admin_points_keyboard():
     kb = points_keyboard(prefix="adminpoint")
     kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Новая точка", callback_data="adminpoint:NEW")])
     kb.inline_keyboard.append([InlineKeyboardButton(text="📥 Импорт из seed_products.xlsx", callback_data="admin:reimport")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="📥 Импорт тех.карт и статей", callback_data="admin:reimport_content")])
     kb.inline_keyboard.append([InlineKeyboardButton(text="📖 Тех.карты", callback_data="admin:recipes")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="📚 Обучение", callback_data="admin:kb")])
     return kb
 
 
@@ -247,12 +262,26 @@ async def admin_trigger(message: Message, state: FSMContext):
 
 
 class RecipeView(StatesGroup):
+    picking_category = State()
     browsing = State()
 
 
-def recipe_list_keyboard(recipes):
-    kb = [[InlineKeyboardButton(text=r["name"], callback_data=f"recipe:{r['id']}")] for r in recipes]
+def recipe_categories_keyboard(categories, has_uncategorized):
+    kb = [[InlineKeyboardButton(text="📖 Все блюда", callback_data="rcat:ALL")]]
+    for i, c in enumerate(categories):
+        kb.append([InlineKeyboardButton(text=c, callback_data=f"rcat:{i}")])
+    if has_uncategorized:
+        kb.append([InlineKeyboardButton(text="📄 Без категории", callback_data="rcat:NONE")])
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="hub:back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def recipe_list_keyboard(recipes, categorized: bool):
+    kb = [[InlineKeyboardButton(text=r["name"], callback_data=f"recipe:{r['id']}")] for r in recipes]
+    if categorized:
+        kb.append([InlineKeyboardButton(text="⬅️ Разделы", callback_data="rcat:menu")])
+    else:
+        kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="hub:back")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
@@ -276,6 +305,20 @@ def format_recipe_card(recipe, ingredients) -> str:
     return "\n".join(lines)
 
 
+async def show_recipe_categories(message: Message, state: FSMContext, edit: bool = False):
+    recipes = db.list_recipes()
+    categories = sorted({r["category"] for r in recipes if r["category"]})
+    has_uncategorized = any(not r["category"] for r in recipes)
+    await state.update_data(recipe_categories=categories)
+    kb = recipe_categories_keyboard(categories, has_uncategorized)
+    text = "📖 Выберите раздел меню:"
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+    await state.set_state(RecipeView.picking_category)
+
+
 async def do_recipes(message: Message, state: FSMContext, user_id: int = None):
     user_id = user_id if user_id is not None else message.from_user.id
     recipes = db.list_recipes()
@@ -284,8 +327,13 @@ async def do_recipes(message: Message, state: FSMContext, user_id: int = None):
             "Тех.карт пока нет." + (" Добавить можно через /admin." if is_admin(user_id) else "")
         )
         return
-    await message.answer("📖 Выберите блюдо:", reply_markup=recipe_list_keyboard(recipes))
-    await state.set_state(RecipeView.browsing)
+    categories = sorted({r["category"] for r in recipes if r["category"]})
+    if not categories:
+        # ни у одного рецепта нет категории — плоский список без лишнего шага
+        await message.answer("📖 Выберите блюдо:", reply_markup=recipe_list_keyboard(recipes, categorized=False))
+        await state.set_state(RecipeView.browsing)
+        return
+    await show_recipe_categories(message, state)
 
 
 @router.message(Command("recipes"))
@@ -296,6 +344,35 @@ async def cmd_recipes(message: Message, state: FSMContext):
 @router.message(F.text.func(lambda t: t and t.strip().lower() in RECIPE_TRIGGERS))
 async def recipes_trigger(message: Message, state: FSMContext):
     await do_recipes(message, state)
+
+
+@router.callback_query(RecipeView.picking_category, F.data.startswith("rcat:"))
+async def recipe_category_chosen(cb: CallbackQuery, state: FSMContext):
+    raw = cb.data.split(":", 1)[1]
+    if raw == "ALL":
+        filtered = db.list_recipes()
+        label = "все блюда"
+    elif raw == "NONE":
+        filtered = [r for r in db.list_recipes() if not r["category"]]
+        label = "без категории"
+    else:
+        data = await state.get_data()
+        category = data["recipe_categories"][int(raw)]
+        filtered = [r for r in db.list_recipes() if r["category"] == category]
+        label = category
+
+    if not filtered:
+        await cb.answer("В этом разделе пока нет блюд.", show_alert=True)
+        return
+    await cb.message.edit_text(f"📖 {label}:", reply_markup=recipe_list_keyboard(filtered, categorized=True))
+    await state.set_state(RecipeView.browsing)
+    await cb.answer()
+
+
+@router.callback_query(RecipeView.browsing, F.data == "rcat:menu")
+async def recipe_back_to_categories(cb: CallbackQuery, state: FSMContext):
+    await show_recipe_categories(cb.message, state, edit=True)
+    await cb.answer()
 
 
 @router.callback_query(RecipeView.browsing, F.data.startswith("recipe:"))
@@ -312,6 +389,90 @@ async def recipe_selected(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+# ============================================================================
+#  БАЗА ЗНАНИЙ (обучение / хранение и маркировка / СанПиН) — просмотр для всех
+# ============================================================================
+
+
+class KBView(StatesGroup):
+    picking_section = State()
+    browsing = State()
+
+
+def kb_sections_keyboard():
+    kb = [
+        [InlineKeyboardButton(text=f"{KB_SECTION_ICONS[s]} {s}", callback_data=f"kbsec:{i}")]
+        for i, s in enumerate(KB_SECTIONS)
+    ]
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="hub:back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def kb_articles_keyboard(articles):
+    kb = [[InlineKeyboardButton(text=a["title"], callback_data=f"kbart:{a['id']}")] for a in articles]
+    kb.append([InlineKeyboardButton(text="⬅️ Разделы", callback_data="kb:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def format_kb_article(article) -> str:
+    lines = [f"📄 <b>{article['title']}</b>"]
+    if article["body"]:
+        lines.append("")
+        lines.append(article["body"])
+    return "\n".join(lines)
+
+
+async def do_kb(message: Message, state: FSMContext, edit: bool = False):
+    text = "📚 Выберите раздел:"
+    kb = kb_sections_keyboard()
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+    await state.set_state(KBView.picking_section)
+
+
+@router.message(F.text.func(lambda t: t and t.strip().lower() in KB_TRIGGERS))
+async def kb_trigger(message: Message, state: FSMContext):
+    await do_kb(message, state)
+
+
+@router.callback_query(KBView.picking_section, F.data.startswith("kbsec:"))
+async def kb_section_chosen(cb: CallbackQuery, state: FSMContext):
+    section = KB_SECTIONS[int(cb.data.split(":")[1])]
+    articles = db.list_kb_articles(section)
+    await state.update_data(kb_section=section)
+    if not articles:
+        await cb.answer("В этом разделе пока нет статей.", show_alert=True)
+        return
+    await cb.message.edit_text(
+        f"{KB_SECTION_ICONS[section]} <b>{section}</b>",
+        reply_markup=kb_articles_keyboard(articles),
+        parse_mode="HTML",
+    )
+    await state.set_state(KBView.browsing)
+    await cb.answer()
+
+
+@router.callback_query(KBView.browsing, F.data == "kb:menu")
+async def kb_back_to_sections(cb: CallbackQuery, state: FSMContext):
+    await do_kb(cb.message, state, edit=True)
+    await cb.answer()
+
+
+@router.callback_query(KBView.browsing, F.data.startswith("kbart:"))
+async def kb_article_selected(cb: CallbackQuery, state: FSMContext):
+    article_id = int(cb.data.split(":")[1])
+    article = db.get_kb_article(article_id)
+    if not article:
+        await cb.answer("Статья не найдена — возможно, её удалили.", show_alert=True)
+        return
+    if article["photo_file_id"]:
+        await cb.message.answer_photo(article["photo_file_id"])
+    await cb.message.answer(format_kb_article(article), parse_mode="HTML")
+    await cb.answer()
+
+
 @router.callback_query(F.data == "back:points")
 async def back_to_points(cb: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -324,6 +485,7 @@ def point_hub_keyboard():
     kb = [
         [InlineKeyboardButton(text="📦 Заказ остатков", callback_data="hub:order")],
         [InlineKeyboardButton(text="📖 Тех.карты", callback_data="hub:recipes")],
+        [InlineKeyboardButton(text="📚 Обучение", callback_data="hub:kb")],
         [InlineKeyboardButton(text="🏠 Сменить точку", callback_data="back:points")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
@@ -363,6 +525,12 @@ async def hub_order(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(PointHub.menu, F.data == "hub:recipes")
 async def hub_recipes(cb: CallbackQuery, state: FSMContext):
     await do_recipes(cb.message, state, user_id=cb.from_user.id)
+    await cb.answer()
+
+
+@router.callback_query(PointHub.menu, F.data == "hub:kb")
+async def hub_kb(cb: CallbackQuery, state: FSMContext):
+    await do_kb(cb.message, state, edit=True)
     await cb.answer()
 
 
@@ -698,6 +866,7 @@ class RecipeAdminForm(StatesGroup):
     menu = State()
     add_name = State()
     add_category = State()
+    add_category_custom = State()
     add_ingredients = State()
     add_method = State()
     add_photo = State()
@@ -1169,6 +1338,13 @@ async def radm_add_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+def recipe_category_pick_keyboard(options):
+    kb = [[InlineKeyboardButton(text=c, callback_data=f"radmcat:{i}")] for i, c in enumerate(options)]
+    kb.append([InlineKeyboardButton(text="➕ Другая категория", callback_data="radmcat:NEW")])
+    kb.append([InlineKeyboardButton(text="🚫 Без категории", callback_data="radmcat:NONE")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
 @router.message(RecipeAdminForm.add_name)
 async def radm_add_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
@@ -1176,14 +1352,39 @@ async def radm_add_name(message: Message, state: FSMContext):
         await message.answer("Название не может быть пустым. Введите ещё раз:")
         return
     await state.update_data(new_name=name)
-    await message.answer("Категория для навигации (например «Супы»), или «-» если без категории:")
+
+    used = {r["category"] for r in db.list_recipes() if r["category"]}
+    options = list(RECIPE_CATEGORY_PRESETS) + [c for c in sorted(used) if c not in RECIPE_CATEGORY_PRESETS]
+    await state.update_data(recipe_category_options=options)
+    await message.answer("Раздел меню для этого блюда:", reply_markup=recipe_category_pick_keyboard(options))
     await state.set_state(RecipeAdminForm.add_category)
 
 
-@router.message(RecipeAdminForm.add_category)
-async def radm_add_category(message: Message, state: FSMContext):
+@router.callback_query(RecipeAdminForm.add_category, F.data.startswith("radmcat:"))
+async def radm_add_category_picked(cb: CallbackQuery, state: FSMContext):
+    raw = cb.data.split(":", 1)[1]
+    if raw == "NEW":
+        await cb.message.edit_text("Введите название нового раздела меню:")
+        await state.set_state(RecipeAdminForm.add_category_custom)
+        await cb.answer()
+        return
+    category = "" if raw == "NONE" else (await state.get_data())["recipe_category_options"][int(raw)]
+    await state.update_data(new_category=category)
+    await cb.message.edit_text(
+        "Ингредиенты — по одному на строку, в формате «Название — количество ед»:\n"
+        "<code>Свёкла — 200 г\nКапуста — 150 г\nСоль — по вкусу</code>",
+        parse_mode="HTML",
+    )
+    await state.set_state(RecipeAdminForm.add_ingredients)
+    await cb.answer()
+
+
+@router.message(RecipeAdminForm.add_category_custom)
+async def radm_add_category_custom(message: Message, state: FSMContext):
     category = (message.text or "").strip()
-    category = "" if category == "-" else category
+    if not category:
+        await message.answer("Название раздела не может быть пустым. Введите ещё раз:")
+        return
     await state.update_data(new_category=category)
     await message.answer(
         "Ингредиенты — по одному на строку, в формате «Название — количество ед»:\n"
@@ -1309,7 +1510,179 @@ async def radm_delete_execute(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router.callback_query(AdminForm.menu, F.data == "admin:delete_point")
+# ---- База знаний: управление (только админ) ----
+
+class KBAdminForm(StatesGroup):
+    picking_section = State()
+    menu = State()
+    add_title = State()
+    add_body = State()
+    add_photo = State()
+    listing = State()
+    confirm_delete = State()
+
+
+def kb_admin_sections_keyboard():
+    kb = [
+        [InlineKeyboardButton(text=f"{KB_SECTION_ICONS[s]} {s}", callback_data=f"kbadmsec:{i}")]
+        for i, s in enumerate(KB_SECTIONS)
+    ]
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:back_points")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def kb_admin_menu_keyboard():
+    kb = [
+        [InlineKeyboardButton(text="➕ Добавить статью", callback_data="kbadm:add")],
+        [InlineKeyboardButton(text="📋 Список / удалить", callback_data="kbadm:list")],
+        [InlineKeyboardButton(text="⬅️ Разделы", callback_data="admin:kb")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.callback_query(F.data == "admin:kb")
+async def admin_kb_sections(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Только для администраторов.", show_alert=True)
+        return
+    await cb.message.edit_text("📚 Обучение — выберите раздел:", reply_markup=kb_admin_sections_keyboard())
+    await state.set_state(KBAdminForm.picking_section)
+    await cb.answer()
+
+
+@router.callback_query(KBAdminForm.picking_section, F.data.startswith("kbadmsec:"))
+async def kbadm_section_chosen(cb: CallbackQuery, state: FSMContext):
+    section = KB_SECTIONS[int(cb.data.split(":")[1])]
+    await state.update_data(kb_section=section)
+    await cb.message.edit_text(
+        f"{KB_SECTION_ICONS[section]} <b>{section}</b> — управление",
+        reply_markup=kb_admin_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(KBAdminForm.menu)
+    await cb.answer()
+
+
+@router.callback_query(KBAdminForm.menu, F.data == "kbadm:add")
+async def kbadm_add_start(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("Заголовок статьи:")
+    await state.set_state(KBAdminForm.add_title)
+    await cb.answer()
+
+
+@router.message(KBAdminForm.add_title)
+async def kbadm_add_title(message: Message, state: FSMContext):
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("Заголовок не может быть пустым. Введите ещё раз:")
+        return
+    await state.update_data(new_title=title)
+    await message.answer("Текст статьи:")
+    await state.set_state(KBAdminForm.add_body)
+
+
+@router.message(KBAdminForm.add_body)
+async def kbadm_add_body(message: Message, state: FSMContext):
+    body = (message.text or "").strip()
+    if not body:
+        await message.answer("Текст не может быть пустым. Введите ещё раз:")
+        return
+    data = await state.get_data()
+    article_id = db.create_kb_article(data["kb_section"], data["new_title"], body)
+    await state.update_data(new_article_id=article_id)
+    await message.answer(
+        f"Статья «{data['new_title']}» сохранена.\nПришлите фото/схему, или «-» чтобы пропустить:"
+    )
+    await state.set_state(KBAdminForm.add_photo)
+
+
+@router.message(KBAdminForm.add_photo, F.photo)
+async def kbadm_add_photo_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_id = message.photo[-1].file_id
+    db.set_kb_article_photo(data["new_article_id"], file_id)
+    await message.answer("Фото добавлено. ✅")
+    await kbadm_back_to_menu(message, state)
+
+
+@router.message(KBAdminForm.add_photo)
+async def kbadm_add_photo_skip(message: Message, state: FSMContext):
+    if (message.text or "").strip() != "-":
+        await message.answer("Пришлите фото как изображение, или «-» чтобы пропустить:")
+        return
+    await kbadm_back_to_menu(message, state)
+
+
+async def kbadm_back_to_menu(message: Message, state: FSMContext):
+    data = await state.get_data()
+    section = data["kb_section"]
+    await message.answer(
+        f"{KB_SECTION_ICONS[section]} <b>{section}</b> — управление",
+        reply_markup=kb_admin_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(KBAdminForm.menu)
+
+
+@router.callback_query(KBAdminForm.menu, F.data == "kbadm:list")
+async def kbadm_list(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    articles = db.list_kb_articles(data["kb_section"])
+    if not articles:
+        await cb.answer("Статей пока нет.", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton(text=a["title"], callback_data=f"kbadmview:{a['id']}")] for a in articles]
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="kbadm:back")])
+    await cb.message.edit_text("Выберите статью:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await state.set_state(KBAdminForm.listing)
+    await cb.answer()
+
+
+@router.callback_query(KBAdminForm.menu, F.data == "kbadm:back")
+@router.callback_query(KBAdminForm.listing, F.data == "kbadm:back")
+async def kbadm_back(cb: CallbackQuery, state: FSMContext):
+    await kbadm_back_to_menu(cb.message, state)
+    await cb.answer()
+
+
+@router.callback_query(KBAdminForm.listing, F.data.startswith("kbadmview:"))
+async def kbadm_view(cb: CallbackQuery, state: FSMContext):
+    article_id = int(cb.data.split(":")[1])
+    article = db.get_kb_article(article_id)
+    if article["photo_file_id"]:
+        await cb.message.answer_photo(article["photo_file_id"])
+    kb = [
+        [InlineKeyboardButton(text="🗑 Удалить статью", callback_data=f"kbadmdel:{article_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="kbadm:list")],
+    ]
+    await cb.message.answer(
+        format_kb_article(article), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+    await cb.answer()
+
+
+@router.callback_query(KBAdminForm.listing, F.data.startswith("kbadmdel:"))
+async def kbadm_delete_confirm(cb: CallbackQuery, state: FSMContext):
+    article_id = int(cb.data.split(":")[1])
+    article = db.get_kb_article(article_id)
+    await state.update_data(delete_article_id=article_id)
+    await cb.message.edit_text(f"Удалить статью «{article['title']}»?", reply_markup=confirm_keyboard())
+    await state.set_state(KBAdminForm.confirm_delete)
+    await cb.answer()
+
+
+@router.callback_query(KBAdminForm.confirm_delete, F.data.startswith("admconfirm:"))
+async def kbadm_delete_execute(cb: CallbackQuery, state: FSMContext):
+    answer = cb.data.split(":")[1]
+    data = await state.get_data()
+    if answer == "yes":
+        article = db.get_kb_article(data["delete_article_id"])
+        db.delete_kb_article(data["delete_article_id"])
+        await cb.message.edit_text(f"Статья «{article['title']}» удалена.")
+    else:
+        await cb.message.edit_text("Отменено.")
+    await kbadm_back_to_menu(cb.message, state)
+    await cb.answer()
 async def admin_delete_point_start(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     point = db.get_point(data["point_id"])
@@ -1353,7 +1726,7 @@ async def admin_confirm_delete(cb: CallbackQuery, state: FSMContext):
                 result = import_products.main(seed_path)
                 text = f"✅ Импорт завершён. Точек: {result['points']}, позиций: {result['products']}."
                 if result["skipped"]:
-                    text += f"\n\n⚠️ Пропущено строк: {len(result['skipped'])}:\n" + "\n".join(
+                    text += f"\n\n⚠️ Пропущено строк каталога: {len(result['skipped'])}:\n" + "\n".join(
                         f"• {s}" for s in result["skipped"][:10]
                     )
                     if len(result["skipped"]) > 10:
@@ -1366,9 +1739,50 @@ async def admin_confirm_delete(cb: CallbackQuery, state: FSMContext):
             await state.set_state(AdminForm.picking_point)
             await cb.answer()
             return
+        elif action == "reimport_content":
+            content_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed_content.xlsx")
+            try:
+                import import_content
+                result = import_content.main(content_path)
+                text = (
+                    f"✅ Импорт завершён.\n"
+                    f"📖 Рецепты: добавлено {result['recipes_added']}, обновлено {result['recipes_updated']}\n"
+                    f"📚 Обучение: добавлено {result['kb_added']}, обновлено {result['kb_updated']}"
+                )
+                all_skipped = result["recipes_skipped"] + result["kb_skipped"]
+                if all_skipped:
+                    text += f"\n\n⚠️ Пропущено строк: {len(all_skipped)}:\n" + "\n".join(
+                        f"• {s}" for s in all_skipped[:10]
+                    )
+                    if len(all_skipped) > 10:
+                        text += f"\n…и ещё {len(all_skipped) - 10}"
+                await cb.message.edit_text(text)
+            except Exception as e:
+                await cb.message.edit_text(f"⚠️ Не удалось выполнить импорт: {e}")
+            await state.clear()
+            await cb.message.answer("Выберите точку для редактирования каталога:", reply_markup=admin_points_keyboard())
+            await state.set_state(AdminForm.picking_point)
+            await cb.answer()
+            return
     else:
         await cb.message.edit_text("Отменено.")
     await show_admin_menu(cb.message, state)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "admin:reimport_content")
+async def admin_reimport_content_start(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(pending_action="reimport_content")
+    await cb.message.edit_text(
+        "📥 Загрузить тех.карты и статьи обучения из seed_content.xlsx?\n\n"
+        "Блюда и статьи с тем же названием (для рецепта) или разделом+заголовком (для статьи) "
+        "будут <b>обновлены</b> — ингредиенты и текст заменятся содержимым файла. "
+        "Новые названия просто добавятся. Фото через этот импорт не переносятся — "
+        "их по-прежнему нужно добавлять внутри бота.",
+        reply_markup=confirm_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminForm.confirm_delete)
     await cb.answer()
 
 
